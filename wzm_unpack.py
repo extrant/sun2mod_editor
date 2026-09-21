@@ -106,6 +106,7 @@ class Vertex:
     bone_reference: int
     normal: tuple[float, float, float]
     tangent: tuple[float, float, float]
+    tangent_sign: int
     uv: tuple[float, float]
     weights: list[tuple[int, float]]
 
@@ -189,9 +190,9 @@ def _parse_vertex(reader: Reader, version: int) -> Vertex:
     normal = reader.vec(3)
     reader.skip(4 if version <= 114 else 8)
     tangent = reader.vec(3)
-    reader.skip(1)
+    tangent_sign = reader.u8()
     uv = reader.vec(2)
-    return Vertex(position_index, bone_reference, normal, tangent, uv, [])
+    return Vertex(position_index, bone_reference, normal, tangent, tangent_sign, uv, [])
 
 
 def _parse_submesh(reader: Reader, version: int) -> SubMesh:
@@ -307,6 +308,13 @@ def _export_texture(source_dir: Path, texture_name: str, texture_dir: Path) -> s
     source = _find_case_insensitive(source_dir, Path(texture_name).name)
     if source is None:
         return None
+    return _export_texture_file(source, texture_dir)
+
+
+def _export_texture_file(source: Path, texture_dir: Path) -> str | None:
+    source = Path(source)
+    if not source.is_file():
+        return None
     texture_dir.mkdir(parents=True, exist_ok=True)
     if Image is not None and source.suffix.casefold() in (".dds", ".tga", ".bmp"):
         destination = texture_dir / f"{source.stem}.png"
@@ -323,9 +331,9 @@ def _export_texture(source_dir: Path, texture_name: str, texture_dir: Path) -> s
 
 def _texture_role(name: str) -> str:
     stem = Path(name).stem.casefold()
-    if re.search(r"(?:^|[_-])no(?:$|[_-])", stem):
+    if re.search(r"(?:^|[_-])no(?:$|[_-])", stem) or stem.endswith(("_n", "-n")):
         return "normal"
-    if re.search(r"(?:^|[_-])sp(?:$|[_-])", stem):
+    if re.search(r"(?:^|[_-])sp(?:$|[_-])", stem) or stem.endswith(("_l", "-l")):
         return "specular"
     if "glow" in stem or "emiss" in stem:
         return "glow"
@@ -345,15 +353,15 @@ def inspect_wzu_materials(path: str | Path) -> list[dict[str, str | int]]:
     source = Path(path)
     data = source.read_bytes()
     rows: list[dict[str, str | int]] = []
-    seen: set[tuple[int, str]] = set()
     pattern = re.compile(rb"[A-Za-z0-9_.-]{3,}\.(?:dds|tga|bmp)", re.I)
-    for match in pattern.finditer(data):
-        name = match.group().decode("ascii", errors="replace")
-        key = (match.start(), name.casefold())
-        if key in seen:
+    for length_offset, length in enumerate(data):
+        if length < 3 or length_offset + 1 + length > len(data):
             continue
-        seen.add(key)
-        rows.append({"offset": match.start(), "name": name, "role": _texture_role(name)})
+        raw = data[length_offset + 1:length_offset + 1 + length]
+        if pattern.fullmatch(raw) is None:
+            continue
+        name = raw.decode("ascii")
+        rows.append({"offset": length_offset + 1, "name": name, "role": _texture_role(name)})
     return rows
 
 
@@ -496,7 +504,10 @@ def export_gltf(model: WZMModel, output_dir: Path, materials: list[dict[str, str
         normals = (source_normals @ coordinate.T).astype("<f4")
         source_tangents = np.asarray([vertex.tangent for vertex in submesh.vertices], dtype=np.float64)
         tangent_xyz = (source_tangents @ coordinate.T).astype("<f4")
-        tangents = np.column_stack((tangent_xyz, np.ones(len(tangent_xyz), dtype="<f4"))).astype("<f4")
+        tangent_signs = np.asarray([
+            1.0 if vertex.tangent_sign else -1.0 for vertex in submesh.vertices
+        ], dtype="<f4")
+        tangents = np.column_stack((tangent_xyz, tangent_signs)).astype("<f4")
         uvs = np.asarray([vertex.uv for vertex in submesh.vertices], dtype="<f4")
         indices = np.asarray(submesh.indices, dtype="<u4")
 
@@ -632,7 +643,12 @@ def export_gltf(model: WZMModel, output_dir: Path, materials: list[dict[str, str
     return gltf_path
 
 
-def export_wzm(model: WZMModel, output_root: str | Path, companion_unit: str | Path | None = None) -> Path:
+def export_wzm(
+    model: WZMModel,
+    output_root: str | Path,
+    companion_unit: str | Path | None = None,
+    material_overrides: dict[int, Path] | None = None,
+) -> Path:
     output_dir = Path(output_root) / model.source.stem
     output_dir.mkdir(parents=True, exist_ok=True)
     obj_path = output_dir / f"{model.source.stem}.obj"
@@ -651,9 +667,13 @@ def export_wzm(model: WZMModel, output_root: str | Path, companion_unit: str | P
 
     materials: list[dict[str, str | None]] = []
     for index, submesh in enumerate(model.submeshes):
+        override = (material_overrides or {}).get(index)
         materials.append({
             "name": _safe_name(submesh.diffuse, f"material_{index}"),
-            "diffuse": _export_texture(model.source.parent, submesh.diffuse, texture_dir),
+            "diffuse": (
+                _export_texture_file(override, texture_dir) if override
+                else _export_texture(model.source.parent, submesh.diffuse, texture_dir)
+            ),
             "specular": _export_texture(model.source.parent, submesh.specular, texture_dir),
             "normal": _export_texture(model.source.parent, role_sources["normal"], texture_dir) if "normal" in role_sources else None,
             "glow": _export_texture(model.source.parent, role_sources["glow"], texture_dir) if "glow" in role_sources else None,

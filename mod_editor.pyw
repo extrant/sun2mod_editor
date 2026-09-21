@@ -4,6 +4,7 @@ import json
 import io
 import hashlib
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -33,6 +34,8 @@ APP_TITLE = "SUN2 MOD 资源编辑器 QQ群:221860548"
 PREVIEW_DIR = TOOL_DIR / "mod_previews"
 BACKUP_DIR = TOOL_DIR / "mod_backups"
 SETTINGS_FILE = TOOL_DIR / "mod_editor_settings.json"
+PREVIEW_MAPPINGS_FILE = TOOL_DIR / "preview_material_mappings.json"
+PREVIEW_MAPPINGS_VERSION = 1
 set_cache_file(TOOL_DIR / "mod_resource_index.json")
 ICON_FILE = next(
     (
@@ -55,6 +58,278 @@ ROLE_LABELS = {
     "effect_auxiliary": "特效辅助",
     "unknown": "其他",
 }
+
+
+BLENDER_EXPORT_SCRIPT = r'''
+import bpy
+import json
+import re
+import shutil
+import sys
+from pathlib import Path
+
+blend_path, gltf_path, manifest_path, extracted_path = sys.argv[sys.argv.index('--') + 1:]
+gltf_path = Path(gltf_path)
+manifest_path = Path(manifest_path)
+extracted_path = Path(extracted_path)
+extracted_path.mkdir(parents=True, exist_ok=True)
+bpy.ops.wm.open_mainfile(filepath=blend_path)
+
+def is_exported(obj):
+    return not any(collection.name.startswith('glTF_not_exported') for collection in obj.users_collection)
+
+bpy.ops.object.select_all(action='DESELECT')
+for obj in bpy.context.scene.objects:
+    obj.select_set(is_exported(obj))
+
+face_counts = {}
+for obj in bpy.context.scene.objects:
+    if not is_exported(obj) or obj.type != 'MESH':
+        continue
+    for polygon in obj.data.polygons:
+        if 0 <= polygon.material_index < len(obj.material_slots):
+            material = obj.material_slots[polygon.material_index].material
+            if material:
+                face_counts[material.name] = face_counts.get(material.name, 0) + 1
+
+def safe_stem(value):
+    value = re.sub(r'[^A-Za-z0-9_.-]+', '_', value).strip('._')
+    return value or 'image'
+
+def payload_suffix(payload):
+    if payload.startswith(b'\x89PNG\r\n\x1a\n'):
+        return '.png'
+    if payload.startswith(b'DDS '):
+        return '.dds'
+    if payload[:3] == b'\xff\xd8\xff':
+        return '.jpg'
+    if payload[:2] == b'BM':
+        return '.bmp'
+    return ''
+
+extracted = {}
+used_names = set()
+blend_directory = Path(blend_path).resolve().parent
+
+def find_nearby_source(image, missing_source):
+    requested = {image.name.casefold()}
+    if image.filepath:
+        requested.add(Path(image.filepath).name.casefold())
+    roots = []
+    for root in (blend_directory, blend_directory.parent):
+        if root.is_dir() and root not in roots:
+            roots.append(root)
+    matches = []
+    seen = set()
+    for root in roots:
+        try:
+            for candidate in root.rglob('*'):
+                if not candidate.is_file() or candidate.name.casefold() not in requested:
+                    continue
+                key = str(candidate.resolve()).casefold()
+                if key not in seen:
+                    seen.add(key)
+                    matches.append(candidate)
+                if len(matches) >= 50:
+                    break
+        except OSError:
+            continue
+    if not matches:
+        return None
+    wanted_parts = {part.casefold() for part in missing_source.parts} if missing_source else set()
+    matches.sort(key=lambda path: (
+        -sum(part.casefold() in wanted_parts for part in path.parts),
+        len(path.parts),
+        str(path).casefold(),
+    ))
+    return matches[0]
+
+def extract_image(image):
+    key = str(image.as_pointer())
+    if key in extracted:
+        return extracted[key]
+    source = Path(bpy.path.abspath(image.filepath, library=image.library)) if image.filepath else None
+    packed = image.packed_file
+    payload = b''
+    packed_error = ''
+    if packed:
+        try:
+            payload = bytes(packed.data)
+        except Exception as exc:
+            packed_error = str(exc)
+    recovered_source = False
+    if not payload and (source is None or not source.is_file()):
+        nearby = find_nearby_source(image, source)
+        if nearby is not None:
+            source = nearby
+            recovered_source = True
+            try:
+                image.filepath = str(source)
+                image.reload()
+            except Exception:
+                pass
+    suffix = payload_suffix(payload)
+    if not suffix and source and source.suffix:
+        suffix = source.suffix.lower()
+    if suffix not in ('.dds', '.tga', '.bmp', '.png', '.jpg', '.jpeg'):
+        suffix = '.png'
+    stem = safe_stem(Path(image.name).stem)
+    name = stem + suffix
+    counter = 2
+    while name.casefold() in used_names:
+        name = f'{stem}_{counter}{suffix}'
+        counter += 1
+    used_names.add(name.casefold())
+    destination = extracted_path / name
+    try:
+        if payload:
+            destination.write_bytes(payload)
+        elif source and source.is_file():
+            shutil.copy2(source, destination)
+        elif image.has_data:
+            old_raw = image.filepath_raw
+            old_format = image.file_format
+            image.filepath_raw = str(destination.with_suffix('.png'))
+            image.file_format = 'PNG'
+            image.save_render(filepath=image.filepath_raw, scene=bpy.context.scene)
+            destination = destination.with_suffix('.png')
+            image.filepath_raw = old_raw
+            image.file_format = old_format
+        else:
+            recorded = bpy.path.abspath(image.filepath, library=image.library) if image.filepath else '（空）'
+            extra = f'；打包数据错误：{packed_error}' if packed_error else ''
+            raise RuntimeError(f'已连接图片，但外部文件不存在且没有打包进 blend；记录路径：{recorded}{extra}')
+    except Exception as exc:
+        extracted[key] = {'image': image.name, 'error': str(exc)}
+        return extracted[key]
+    extracted[key] = {
+        'image': image.name,
+        'path': str(destination.resolve()),
+        'packed': bool(packed),
+        'source': str(source) if source else '',
+        'recovered_source': recovered_source,
+    }
+    return extracted[key]
+
+def linked_images(socket):
+    if socket is None:
+        return []
+    queue = [(socket, 0)]
+    seen_sockets = set()
+    found = []
+    while queue:
+        current, depth = queue.pop(0)
+        pointer = current.as_pointer()
+        if pointer in seen_sockets or depth > 24:
+            continue
+        seen_sockets.add(pointer)
+        for link in current.links:
+            node = link.from_node
+            if node.type == 'TEX_IMAGE' and node.image:
+                found.append((depth, node, node.image))
+                continue
+            for upstream in node.inputs:
+                if upstream.is_linked:
+                    queue.append((upstream, depth + 1))
+    found.sort(key=lambda item: (item[0], item[1].name.casefold()))
+    unique = []
+    seen_images = set()
+    for depth, node, image in found:
+        key = image.as_pointer()
+        if key not in seen_images:
+            seen_images.add(key)
+            unique.append((depth, node, image))
+    return unique
+
+def shader_nodes(material):
+    if not material.use_nodes or not material.node_tree:
+        return []
+    outputs = [node for node in material.node_tree.nodes if node.type == 'OUTPUT_MATERIAL' and node.is_active_output]
+    if not outputs:
+        outputs = [node for node in material.node_tree.nodes if node.type == 'OUTPUT_MATERIAL']
+    queue = []
+    for output in outputs:
+        surface = output.inputs.get('Surface')
+        if surface:
+            queue.append((surface, 0))
+    seen = set()
+    result = []
+    while queue:
+        socket, depth = queue.pop(0)
+        if socket.as_pointer() in seen or depth > 24:
+            continue
+        seen.add(socket.as_pointer())
+        for link in socket.links:
+            node = link.from_node
+            if node.type in ('BSDF_PRINCIPLED', 'BSDF_DIFFUSE'):
+                result.append((depth, node))
+            else:
+                for upstream in node.inputs:
+                    if upstream.is_linked:
+                        queue.append((upstream, depth + 1))
+    result.sort(key=lambda item: (item[0], 0 if item[1].type == 'BSDF_PRINCIPLED' else 1, item[1].name.casefold()))
+    return result
+
+def input_by_names(node, names):
+    for name in names:
+        socket = node.inputs.get(name)
+        if socket is not None:
+            return socket
+    return None
+
+material_rows = []
+for material in bpy.data.materials:
+    if face_counts.get(material.name, 0) <= 0:
+        continue
+    row = {
+        'name': material.name, 'face_count': face_counts[material.name],
+        'roles': {}, 'failed_roles': {}, 'warnings': [],
+    }
+    shaders = shader_nodes(material)
+    if not shaders:
+        row['warnings'].append('材质输出没有连接到 Principled/Diffuse BSDF')
+        material_rows.append(row)
+        continue
+    if len(shaders) > 1:
+        row['warnings'].append(f'材质输出包含 {len(shaders)} 个表面着色器，按最接近输出的着色器读取')
+    shader = shaders[0][1]
+    role_sockets = {
+        'diffuse': input_by_names(shader, ('Base Color', 'Color')),
+        'normal': input_by_names(shader, ('Normal',)),
+        'specular': input_by_names(shader, ('Specular IOR Level', 'Specular')),
+    }
+    for role, socket in role_sockets.items():
+        candidates = linked_images(socket)
+        if not candidates:
+            continue
+        depth, node, image = candidates[0]
+        saved = extract_image(image)
+        if 'path' not in saved:
+            row['failed_roles'][role] = {'image': image.name, 'error': saved.get('error', '未知错误')}
+            row['warnings'].append(f'{role} 图片 {image.name} 提取失败：{saved.get("error", "未知错误")}')
+            continue
+        row['roles'][role] = {
+            **saved,
+            'node': node.name,
+            'socket': socket.name,
+            'candidate_count': len(candidates),
+        }
+        if saved.get('recovered_source'):
+            row['warnings'].append(f'{role} 图片原路径失效，已在相邻模型目录找回：{saved.get("source", "")}')
+        if len(candidates) > 1:
+            row['warnings'].append(
+                f'{role} 输入链包含 {len(candidates)} 张图片，自动选择离着色器最近的 {image.name}'
+            )
+    material_rows.append(row)
+
+manifest_path.write_text(json.dumps({'materials': material_rows}, ensure_ascii=False, indent=2), encoding='utf-8')
+bpy.ops.export_scene.gltf(
+    filepath=str(gltf_path), export_format='GLTF_SEPARATE', export_texture_dir='textures',
+    export_skins=True, export_all_influences=True, export_tangents=True,
+    export_morph=False, export_animations=False, export_extras=True,
+    export_materials='EXPORT', use_selection=True,
+)
+'''
 
 
 def find_client_data(selected: Path) -> tuple[Path, Path]:
@@ -90,6 +365,27 @@ def save_settings(game_path: Path, client_data: Path) -> None:
         "client_data": str(client_data),
     }
     SETTINGS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_preview_mappings() -> dict:
+    empty = {"version": PREVIEW_MAPPINGS_VERSION, "models": {}}
+    if not PREVIEW_MAPPINGS_FILE.is_file():
+        return empty
+    try:
+        payload = json.loads(PREVIEW_MAPPINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return empty
+    if payload.get("version") != PREVIEW_MAPPINGS_VERSION or not isinstance(payload.get("models"), dict):
+        return empty
+    return payload
+
+
+def save_preview_mappings(payload: dict) -> None:
+    payload["version"] = PREVIEW_MAPPINGS_VERSION
+    payload.setdefault("models", {})
+    temporary = PREVIEW_MAPPINGS_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, PREVIEW_MAPPINGS_FILE)
 
 
 def viewer_command(*arguments: object) -> list[str]:
@@ -175,6 +471,7 @@ class ModEditor(tk.Tk):
         self.current_material: dict | None = None
         self.material_by_row: dict[str, dict] = {}
         self.replacement_map: dict[str, Path] = {}
+        self.preview_mappings = load_preview_mappings()
         self.preview_photo = None
         self.preview_generation = 0
         self.preview_process: subprocess.Popen | None = None
@@ -280,15 +577,17 @@ class ModEditor(tk.Tk):
         ttk.Label(left, text="模型材质", style="Section.TLabel").pack(anchor="w")
         self.edit_model_label = ttk.Label(left, text="尚未选择模型", wraplength=380)
         self.edit_model_label.pack(fill="x", pady=(4, 7))
-        self.material_tree = ttk.Treeview(left, columns=("role", "reuse", "replacement"), show="tree headings", selectmode="browse")
+        self.material_tree = ttk.Treeview(left, columns=("role", "reuse", "preview", "replacement"), show="tree headings", selectmode="browse")
         self.material_tree.heading("#0", text="材质文件")
         self.material_tree.heading("role", text="作用")
         self.material_tree.heading("reuse", text="复用")
+        self.material_tree.heading("preview", text="3D槽位")
         self.material_tree.heading("replacement", text="待替换")
-        self.material_tree.column("#0", width=235)
-        self.material_tree.column("role", width=100, anchor="center")
+        self.material_tree.column("#0", width=205)
+        self.material_tree.column("role", width=90, anchor="center")
         self.material_tree.column("reuse", width=60, anchor="center")
-        self.material_tree.column("replacement", width=150)
+        self.material_tree.column("preview", width=70, anchor="center")
+        self.material_tree.column("replacement", width=120)
         self.material_tree.pack(fill="both", expand=True)
         self.material_tree.bind("<<TreeviewSelect>>", self._material_selected)
         ttk.Label(left, textvariable=self.material_info_var, wraplength=390, justify="left").pack(fill="x", pady=7)
@@ -313,6 +612,11 @@ class ModEditor(tk.Tk):
         ttk.Button(replacement_modes, text="原图 100%", command=lambda: self.replacement_image.set_fit(False)).pack(side="left", fill="x", expand=True)
         ttk.Button(replacement_modes, text="适应窗口", command=lambda: self.replacement_image.set_fit(True)).pack(side="left", fill="x", expand=True, padx=(4, 0))
         ttk.Label(right, textvariable=self.replacement_var, wraplength=700).pack(fill="x", pady=(7, 4))
+        preview_commands = ttk.LabelFrame(right, text="3D 预览贴图映射（只影响预览，不修改游戏文件）", padding=5)
+        preview_commands.pack(fill="x", pady=(0, 5))
+        ttk.Button(preview_commands, text="将当前材质映射到模型槽位", command=self._map_current_material_for_preview).pack(side="left")
+        ttk.Button(preview_commands, text="从文件选择并映射", command=self._map_file_for_preview).pack(side="left", padx=5)
+        ttk.Button(preview_commands, text="清除映射", command=self._clear_preview_mapping).pack(side="left")
         commands = ttk.Frame(right)
         commands.pack(fill="x")
         ttk.Button(commands, text="为所选材质选择图片", command=self._choose_replacement).pack(side="left")
@@ -535,11 +839,18 @@ class ModEditor(tk.Tk):
         self.material_by_row.clear()
         if not self.current_model or not self.index_data:
             return
+        mapped_paths: dict[str, list[int]] = {}
+        for slot, path in self._preview_slot_paths(self.current_model, existing_only=False).items():
+            mapped_paths.setdefault(str(path.resolve()).casefold(), []).append(slot)
         for row in self.current_model["materials"]:
             reuse = self.index_data["materials"].get(row["name"].casefold(), {}).get("model_count", 0)
             replacement = self.replacement_map.get(row.get("path", ""))
+            path_text = row.get("path", "")
+            slots = mapped_paths.get(str(Path(path_text).resolve()).casefold(), []) if path_text else []
+            preview_slots = ", ".join(f"#{slot + 1}" for slot in slots)
             item = self.material_tree.insert("", "end", text=row["name"], values=(
-                ROLE_LABELS.get(row["role"], row["role"]), reuse, replacement.name if replacement else "",
+                ROLE_LABELS.get(row["role"], row["role"]), reuse, preview_slots,
+                replacement.name if replacement else "",
             ))
             self.material_tree.set(item, "role", ROLE_LABELS.get(row["role"], row["role"]))
             self.material_by_row[item] = row
@@ -552,8 +863,7 @@ class ModEditor(tk.Tk):
         PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
         destination = PREVIEW_DIR / f"preview_{uuid.uuid4().hex}.png"
         self.preview_label.configure(image="", text="正在生成材质化 3D 预览…")
-        command = viewer_command(
-            self.current_model["path"],
+        command = self._viewer_command(
             "--no-effect", "--hidden", "--screenshot", str(destination), "--close-after-frame", "5",
         )
         def worker():
@@ -576,7 +886,7 @@ class ModEditor(tk.Tk):
     def _open_interactive(self) -> None:
         if not self.current_model:
             return
-        subprocess.Popen(viewer_command(self.current_model["path"], "--no-effect"), cwd=str(TOOL_DIR))
+        subprocess.Popen(self._viewer_command("--no-effect"), cwd=str(TOOL_DIR))
 
     def _open_model_dir(self) -> None:
         if self.current_model:
@@ -597,6 +907,7 @@ class ModEditor(tk.Tk):
         if not self.current_model:
             return
         model_record = self.current_model
+        material_overrides = self._preview_slot_paths(model_record)
         self.status_var.set(f"正在导出 Blender 包：{model_record['name']}")
         def worker():
             try:
@@ -606,6 +917,7 @@ class ModEditor(tk.Tk):
                     model,
                     TOOL_DIR / "blender_exports",
                     companion_unit=model_record.get("wzu") or None,
+                    material_overrides=material_overrides,
                 )
                 gltf = output / f"{Path(model_record['path']).stem}.gltf"
                 blend = output / f"{Path(model_record['path']).stem}.blend"
@@ -726,6 +1038,187 @@ class ModEditor(tk.Tk):
                 self.model_tree.see(row)
                 self._model_selected()
                 break
+
+    @staticmethod
+    def _preview_mapping_key(model: dict) -> str:
+        return str(model["relative"]).replace("/", "\\").casefold()
+
+    def _preview_mapping_entry(self, model: dict, create: bool = False) -> dict | None:
+        models = self.preview_mappings.setdefault("models", {})
+        key = self._preview_mapping_key(model)
+        entry = models.get(key)
+        if entry is None and create:
+            entry = {"relative": model["relative"], "slots": {}}
+            models[key] = entry
+        if create and isinstance(entry, dict) and not isinstance(entry.get("slots"), dict):
+            entry["slots"] = {}
+        return entry if isinstance(entry, dict) else None
+
+    def _preview_slot_paths(self, model: dict, existing_only: bool = True) -> dict[int, Path]:
+        entry = self._preview_mapping_entry(model)
+        if not entry or not isinstance(entry.get("slots"), dict):
+            return {}
+        model_dir = Path(model["path"]).parent
+        result: dict[int, Path] = {}
+        for slot_text, value in entry["slots"].items():
+            try:
+                slot = int(slot_text)
+                path = Path(str(value))
+            except (TypeError, ValueError):
+                continue
+            if not path.is_absolute():
+                path = model_dir / path
+            if not existing_only or path.is_file():
+                result[slot] = path
+        return result
+
+    def _viewer_command(self, *arguments: object) -> list[str]:
+        if not self.current_model:
+            return []
+        command: list[object] = [self.current_model["path"], *arguments]
+        for slot, path in sorted(self._preview_slot_paths(self.current_model).items()):
+            command.extend(("--texture-override", f"{slot}={path}"))
+        return viewer_command(*command)
+
+    def _choose_preview_slot(self, model: dict, allowed_slots: list[int] | None = None) -> int | None:
+        parsed = parse_wzm(model["path"])
+        slots = allowed_slots if allowed_slots is not None else list(range(len(parsed.submeshes)))
+        if not slots:
+            return None
+        if len(slots) == 1:
+            return slots[0]
+
+        current = self._preview_slot_paths(model, existing_only=False)
+        result: dict[str, int | None] = {"slot": None}
+        window = tk.Toplevel(self)
+        window.title("选择模型材质槽位")
+        window.geometry("760x390")
+        window.transient(self)
+        window.grab_set()
+        frame = ttk.Frame(window, padding=8)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="请选择这张贴图对应的 WZM 材质槽位：").pack(anchor="w", pady=(0, 6))
+        tree = ttk.Treeview(frame, columns=("source", "mapped"), show="tree headings", selectmode="browse")
+        tree.heading("#0", text="槽位")
+        tree.heading("source", text="WZM 原始材质名")
+        tree.heading("mapped", text="当前手动映射")
+        tree.column("#0", width=70, anchor="center")
+        tree.column("source", width=300)
+        tree.column("mapped", width=330)
+        rows: dict[str, int] = {}
+        for slot in slots:
+            submesh = parsed.submeshes[slot]
+            row = tree.insert(
+                "", "end", text=f"#{slot + 1}",
+                values=(submesh.diffuse or "（未命名）", str(current.get(slot, ""))),
+            )
+            rows[row] = slot
+        tree.pack(fill="both", expand=True)
+        first = next(iter(rows), None)
+        if first:
+            tree.selection_set(first)
+            tree.focus(first)
+
+        def accept(_event=None):
+            selection = tree.selection()
+            if selection:
+                result["slot"] = rows[selection[0]]
+                window.destroy()
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(7, 0))
+        ttk.Button(buttons, text="取消", command=window.destroy).pack(side="right")
+        ttk.Button(buttons, text="确定", command=accept).pack(side="right", padx=(0, 5))
+        tree.bind("<Double-1>", accept)
+        window.protocol("WM_DELETE_WINDOW", window.destroy)
+        self.wait_window(window)
+        return result["slot"]
+
+    def _save_preview_mapping(self, texture_path: Path) -> None:
+        if not self.current_model:
+            return
+        try:
+            with Image.open(texture_path) as image:
+                image.verify()
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"无法读取所选贴图：\n{exc}")
+            return
+        try:
+            slot = self._choose_preview_slot(self.current_model)
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"读取模型材质槽失败：\n{exc}")
+            return
+        if slot is None:
+            return
+        model_dir = Path(self.current_model["path"]).parent.resolve()
+        resolved = texture_path.resolve()
+        try:
+            stored_path = str(resolved.relative_to(model_dir))
+        except ValueError:
+            stored_path = str(resolved)
+        entry = self._preview_mapping_entry(self.current_model, create=True)
+        assert entry is not None
+        entry.setdefault("slots", {})[str(slot)] = stored_path
+        try:
+            save_preview_mappings(self.preview_mappings)
+        except OSError as exc:
+            messagebox.showerror(APP_TITLE, f"保存 3D 贴图映射失败：\n{exc}")
+            return
+        self.status_var.set(f"已保存 3D 贴图映射：槽位 #{slot + 1} → {texture_path.name}")
+        self._populate_materials()
+        self._render_preview()
+
+    def _map_current_material_for_preview(self) -> None:
+        if not self.current_material:
+            messagebox.showinfo(APP_TITLE, "请先在左侧选择一张材质。")
+            return
+        path_text = self.current_material.get("path", "")
+        if not path_text or not Path(path_text).is_file():
+            messagebox.showinfo(APP_TITLE, "该材质文件未定位，请使用“从文件选择并映射”。")
+            return
+        self._save_preview_mapping(Path(path_text))
+
+    def _map_file_for_preview(self) -> None:
+        if not self.current_model:
+            messagebox.showinfo(APP_TITLE, "请先选择一个模型。")
+            return
+        value = filedialog.askopenfilename(
+            title="选择仅用于 3D 预览的贴图",
+            initialdir=str(Path(self.current_model["path"]).parent),
+            filetypes=(("图片", "*.dds *.tga *.png *.bmp *.jpg *.jpeg"), ("所有文件", "*.*")),
+        )
+        if value:
+            self._save_preview_mapping(Path(value))
+
+    def _clear_preview_mapping(self) -> None:
+        if not self.current_model:
+            return
+        entry = self._preview_mapping_entry(self.current_model)
+        slots_data = entry.get("slots", {}) if entry else {}
+        if not isinstance(slots_data, dict):
+            slots_data = {}
+        configured = sorted(int(slot) for slot in slots_data if str(slot).isdigit())
+        if not configured:
+            messagebox.showinfo(APP_TITLE, "当前模型没有手动 3D 贴图映射。")
+            return
+        try:
+            slot = self._choose_preview_slot(self.current_model, configured)
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"读取模型材质槽失败：\n{exc}")
+            return
+        if slot is None:
+            return
+        slots_data.pop(str(slot), None)
+        if not slots_data:
+            self.preview_mappings.get("models", {}).pop(self._preview_mapping_key(self.current_model), None)
+        try:
+            save_preview_mappings(self.preview_mappings)
+        except OSError as exc:
+            messagebox.showerror(APP_TITLE, f"保存 3D 贴图映射失败：\n{exc}")
+            return
+        self.status_var.set(f"已清除槽位 #{slot + 1} 的 3D 贴图映射")
+        self._populate_materials()
+        self._render_preview()
 
     def _choose_replacement(self) -> None:
         if not self.current_material:
@@ -879,6 +1372,89 @@ class ModEditor(tk.Tk):
             raise
         return backup_root
 
+    def _apply_blend_resources(
+        self,
+        staged_wzm: Path,
+        target_wzm: Path,
+        material_pairs: list[tuple[Path, Path]],
+        label: str,
+        staged_wzu: Path | None = None,
+        target_wzu: Path | None = None,
+    ) -> Path:
+        if self.client_data is None:
+            raise RuntimeError("请先设置游戏路径")
+        if not staged_wzm.is_file() or not target_wzm.is_file():
+            raise FileNotFoundError(f"模型文件不存在：\n{staged_wzm}\n{target_wzm}")
+        from wzm_unpack import parse_wzm
+        staged_model = parse_wzm(staged_wzm)
+        original_model = parse_wzm(target_wzm)
+        if staged_model.version != original_model.version:
+            raise ValueError("回流 WZM 版本与原模型不一致")
+        if [bone.name for bone in staged_model.bones] != [bone.name for bone in original_model.bones]:
+            raise ValueError("回流 WZM 骨骼结构与原模型不一致")
+
+        unique_materials: dict[str, tuple[Path, Path]] = {}
+        for source, target in material_pairs:
+            if not source.is_file():
+                raise FileNotFoundError(f"Blender 提取的贴图文件不存在：\n{source}")
+            unique_materials[str(target.resolve()).casefold()] = (source, target)
+        pairs = [(staged_wzm, target_wzm, "model")]
+        if staged_wzu is not None or target_wzu is not None:
+            if staged_wzu is None or target_wzu is None or not staged_wzu.is_file() or not target_wzu.is_file():
+                raise FileNotFoundError(f"WZU 回流文件不存在：\n{staged_wzu}\n{target_wzu}")
+            pairs.append((staged_wzu, target_wzu, "unit"))
+        pairs.extend((source, target, "material") for source, target in unique_materials.values())
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        backup_root = BACKUP_DIR / timestamp
+        records: list[dict] = []
+        for source, target, kind in pairs:
+            relative = target.resolve().relative_to(self.client_data.resolve())
+            saved = backup_root / relative
+            existed = target.is_file()
+            if existed:
+                saved.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, saved)
+            records.append({
+                "target": str(target), "relative": str(relative),
+                "backup": str(saved) if existed else "", "existed": existed,
+                "kind": kind, "original_sha256": sha256(target) if existed else "",
+                "replacement": str(source), "replacement_sha256": sha256(source),
+            })
+        manifest = {
+            "created": datetime.now().isoformat(timespec="seconds"),
+            "label": label,
+            "files": records,
+        }
+        (backup_root / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8",
+        )
+
+        completed: list[dict] = []
+        temporary_files: list[Path] = []
+        try:
+            for record, (source, target, kind) in zip(records, pairs):
+                temp = target.with_name(target.name + ".modtmp")
+                temporary_files.append(temp)
+                if kind in ("model", "unit"):
+                    shutil.copy2(source, temp)
+                    if kind == "model":
+                        parse_wzm(temp)
+                else:
+                    self._write_material(source, target, temp)
+                os.replace(temp, target)
+                completed.append(record)
+        except Exception:
+            for temp in temporary_files:
+                temp.unlink(missing_ok=True)
+            for record in completed:
+                if record.get("existed", True):
+                    shutil.copy2(record["backup"], record["target"])
+                else:
+                    Path(record["target"]).unlink(missing_ok=True)
+            raise
+        return backup_root
+
     def _restore_latest(self) -> None:
         backups = sorted((path for path in BACKUP_DIR.iterdir() if path.is_dir()), reverse=True) if BACKUP_DIR.is_dir() else []
         if not backups:
@@ -889,7 +1465,10 @@ class ModEditor(tk.Tk):
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             records = manifest.get("files") or [manifest]
             for record in records:
-                shutil.copy2(record["backup"], record["target"])
+                if record.get("existed", True):
+                    shutil.copy2(record["backup"], record["target"])
+                else:
+                    Path(record["target"]).unlink(missing_ok=True)
         except Exception as exc:
             messagebox.showerror(APP_TITLE, f"恢复失败：\n{exc}")
             return
@@ -898,6 +1477,12 @@ class ModEditor(tk.Tk):
         current_target = Path(self.current_material["path"]) if self.current_material and self.current_material.get("path") else None
         if current_target and any(Path(record["target"]) == current_target for record in records):
             self.current_image.show(current_target)
+        if self.current_model and any(Path(record["target"]) == Path(self.current_model["path"]) for record in records):
+            self.current_model["bones"] = -1
+            self.current_model["submeshes"] = -1
+            self.current_model["triangles"] = -1
+            self._refresh_current_model_materials()
+            self._load_model_details(self.current_model)
         self._render_preview()
 
     @staticmethod
@@ -905,6 +1490,20 @@ class ModEditor(tk.Tk):
         with Image.open(path) as image:
             rgba = image.convert("RGBA")
             return rgba.size, hashlib.sha256(rgba.tobytes()).hexdigest()
+
+    def _refresh_current_model_materials(self) -> None:
+        if not self.current_model:
+            return
+        from mod_resource_index import _texture_rows
+        model_path = Path(self.current_model["path"])
+        files = {path.name.casefold(): path for path in model_path.parent.iterdir() if path.is_file()}
+        wzu_text = self.current_model.get("wzu", "")
+        wzu_path = Path(wzu_text) if wzu_text and Path(wzu_text).is_file() else None
+        self.current_model["materials"] = _texture_rows(
+            model_path, model_path.read_bytes(), wzu_path, files,
+        )
+        self.current_material = None
+        self._populate_materials()
 
     def _import_blend(self) -> None:
         if not self.current_model:
@@ -921,42 +1520,275 @@ class ModEditor(tk.Tk):
         stage = TOOL_DIR / "mod_staging" / uuid.uuid4().hex
         stage.mkdir(parents=True, exist_ok=True)
         script = stage / "export_blend.py"
-        script.write_text(
-            "import bpy, sys\n"
-            "blend, gltf = sys.argv[sys.argv.index('--') + 1:]\n"
-            "bpy.ops.wm.open_mainfile(filepath=blend)\n"
-            "bpy.ops.export_scene.gltf(filepath=gltf, export_format='GLTF_SEPARATE', "
-            "export_texture_dir='textures', export_skins=True, export_morph=False, export_materials='EXPORT')\n",
-            encoding="utf-8",
-        )
+        script.write_text(BLENDER_EXPORT_SCRIPT, encoding="utf-8")
         gltf = stage / "edited.gltf"
+        shader_manifest = stage / "shader_materials.json"
+        extracted = stage / "shader_images"
         self.status_var.set("正在读取 Blender 修改并计算差异")
         def worker():
             try:
                 subprocess.run(
-                    [str(blender), "--background", "--python", str(script), "--", blend, str(gltf)],
+                    [
+                        str(blender), "--background", "--python", str(script), "--",
+                        blend, str(gltf), str(shader_manifest), str(extracted),
+                    ],
                     check=True, timeout=180, creationflags=0x08000000,
                 )
-                report = self._compare_blend_export(model_record, gltf)
+                report = self._compare_blend_export(model_record, gltf, shader_manifest)
                 self.after(0, self._show_blend_diff, Path(blend), stage, report)
             except Exception as exc:
                 self.after(0, messagebox.showerror, APP_TITLE, f"读取 Blender 文件失败：\n{exc}")
                 self.after(0, self.status_var.set, "Blender 差异分析失败")
         threading.Thread(target=worker, daemon=True).start()
 
-    def _compare_blend_export(self, model_record: dict, gltf_path: Path) -> dict:
+    @staticmethod
+    def _clean_material_name(value: str) -> str:
+        value = re.sub(r"\.\d{3}$", "", value.casefold())
+        return re.sub(r"[^a-z0-9]+", "", value)
+
+    @staticmethod
+    def _game_texture_name(
+        model_stem: str,
+        slot: int,
+        role: str,
+        image_name: str,
+        used: set[str],
+    ) -> str:
+        model_part = re.sub(r"[^A-Za-z0-9_-]+", "_", model_stem).strip("_") or "model"
+        image_part = re.sub(r"[^A-Za-z0-9_-]+", "_", Path(image_name).stem).strip("_") or "image"
+        base = f"{model_part}_{slot + 1}_{role}_{image_part}"[:220].rstrip("_")
+        candidate = f"{base}.dds"
+        counter = 2
+        while candidate.casefold() in used:
+            candidate = f"{base}_{counter}.dds"
+            counter += 1
+        used.add(candidate.casefold())
+        return candidate
+
+    def _compare_blend_export(
+        self,
+        model_record: dict,
+        gltf_path: Path,
+        shader_manifest_path: Path,
+    ) -> dict:
         from wzm_unpack import parse_wzm
+        from wzm_repack import repack_wzm_from_gltf, rewrite_wzu_texture_names
         original = parse_wzm(model_record["path"])
         edited = json.loads(gltf_path.read_text(encoding="utf-8"))
+        shader_document = json.loads(shader_manifest_path.read_text(encoding="utf-8"))
+        shader_materials = [row for row in shader_document.get("materials", []) if isinstance(row, dict)]
+        shader_by_name = {
+            self._clean_material_name(str(row.get("name", ""))): row
+            for row in shader_materials
+            if self._clean_material_name(str(row.get("name", "")))
+        }
+        gltf_materials = edited.get("materials", [])
+        used_material_names: list[str] = []
+        for mesh in edited.get("meshes", []):
+            for primitive in mesh.get("primitives", []):
+                material_index = primitive.get("material")
+                if isinstance(material_index, int) and 0 <= material_index < len(gltf_materials):
+                    name = str(gltf_materials[material_index].get("name", ""))
+                    if name and name not in used_material_names:
+                        used_material_names.append(name)
+        used_shader_materials = [
+            shader_by_name[key]
+            for key in (self._clean_material_name(name) for name in used_material_names)
+            if key in shader_by_name
+        ]
+
+        shader_bindings: list[dict | None] = []
+        shader_warnings: list[str] = []
+        if len(original.submeshes) == 1:
+            candidates = sorted(
+                used_shader_materials or shader_materials,
+                key=lambda row: int(row.get("face_count", 0)), reverse=True,
+            )
+            shader_bindings = [candidates[0] if candidates else None]
+            textured = [row for row in candidates if row.get("roles", {}).get("diffuse")]
+            if len(textured) > 1:
+                shader_warnings.append(
+                    f"原 WZM 只有一个材质槽，但 Blender 有 {len(textured)} 个带基础色图片的材质；"
+                    f"已按使用面数选择 {candidates[0].get('name', '第一个材质')}。若要同时保留多套材质，请先在 Blender 烘焙为一张贴图。"
+                )
+        else:
+            ordered = used_shader_materials or shader_materials
+            for index, submesh in enumerate(original.submeshes):
+                key = self._clean_material_name(submesh.diffuse)
+                binding = shader_by_name.get(key)
+                if binding is None and index < len(ordered):
+                    binding = ordered[index]
+                    shader_warnings.append(
+                        f"材质槽 #{index + 1} 未按名称匹配，已按顺序使用 Blender 材质 {binding.get('name', '')}"
+                    )
+                shader_bindings.append(binding)
+
+        material_names: dict[int, dict[str, str]] = {}
+        texture_diffs: list[dict] = []
+        used_texture_names: set[str] = set()
+        model_dir = Path(model_record["path"]).parent
+        role_targets = {
+            role: [
+                row for row in model_record.get("materials", [])
+                if row.get("role") == role and row.get("name")
+            ]
+            for role in ("diffuse", "normal", "specular")
+        }
+        wzu_path = Path(model_record["wzu"]) if model_record.get("wzu") else None
+        wzu_replacements: dict[str, str] = {}
+
+        def neutral_texture(role: str) -> dict:
+            neutral_dir = gltf_path.parent / "shader_images"
+            neutral_dir.mkdir(parents=True, exist_ok=True)
+            if role == "normal":
+                path = neutral_dir / "__neutral_normal.png"
+                color = (128, 128, 255, 255)
+                label = "Blender 未连接法线（中性法线）"
+            else:
+                path = neutral_dir / "__neutral_specular.png"
+                color = (0, 0, 0, 255)
+                label = "Blender 未连接高光（黑色屏蔽）"
+            if not path.is_file():
+                Image.new("RGBA", (4, 4), color).save(path)
+            return {"path": str(path), "image": label, "generated_neutral": True}
+
+        def add_texture(
+            slot: int,
+            role: str,
+            source_info: dict,
+            target_name: str,
+            required_by_wzm: bool = False,
+        ) -> bool:
+            source = Path(str(source_info["path"]))
+            if not source.is_file():
+                shader_warnings.append(f"Blender 图片提取文件不存在：{source}")
+                return False
+            target = model_dir / Path(target_name).name
+            try:
+                new_size, new_hash = self._pixel_digest(source)
+            except Exception as exc:
+                shader_warnings.append(f"无法读取 Blender 图片 {source.name}：{exc}")
+                return False
+            if target.is_file():
+                old_size, old_hash = self._pixel_digest(target)
+                original_text = f"{old_size[0]}×{old_size[1]}"
+                changed = old_size != new_size or old_hash != new_hash
+                status = "从 Blender 着色器提取（将替换）" if changed else "图片内容相同"
+            else:
+                original_text = "将新建"
+                changed = True
+                status = "从 Blender 着色器提取（将新建）"
+            if source_info.get("generated_neutral"):
+                status = "未连接该层；自动写入中性图" if changed else "中性图已存在"
+            texture_diffs.append({
+                "name": f"槽位 #{slot + 1} · {ROLE_LABELS.get(role, role)} · {source_info.get('image', source.name)}",
+                "role": role,
+                "target": target,
+                "source": source if changed else None,
+                "original": original_text,
+                "edited": f"{new_size[0]}×{new_size[1]}",
+                "status": status,
+                "required_by_wzm": required_by_wzm,
+            })
+            return True
+
+        for slot, (submesh, binding) in enumerate(zip(original.submeshes, shader_bindings)):
+            if not binding:
+                shader_warnings.append(f"材质槽 #{slot + 1} 没有找到可读取的 Blender 着色器")
+                continue
+            shader_warnings.extend(
+                f"{binding.get('name', f'槽位 #{slot + 1}')}：{warning}"
+                for warning in binding.get("warnings", [])
+            )
+            roles = binding.get("roles", {})
+            failed_roles = binding.get("failed_roles", {})
+            diffuse = roles.get("diffuse")
+            if diffuse:
+                name = self._game_texture_name(
+                    Path(model_record["path"]).stem, slot, "di", str(diffuse.get("image", "diffuse")),
+                    used_texture_names,
+                )
+                if add_texture(slot, "diffuse", diffuse, name, required_by_wzm=True):
+                    material_names.setdefault(slot, {})["diffuse"] = name
+                    if wzu_path and role_targets["diffuse"]:
+                        old = role_targets["diffuse"][min(slot, len(role_targets["diffuse"]) - 1)]["name"]
+                        wzu_replacements[str(old)] = name
+            elif "diffuse" not in failed_roles:
+                shader_warnings.append(
+                    f"{binding.get('name', f'槽位 #{slot + 1}')} 的基础色没有连接图片，保留原 WZM 基础贴图引用"
+                )
+            specular = roles.get("specular")
+            if specular:
+                name = self._game_texture_name(
+                    Path(model_record["path"]).stem, slot, "sp", str(specular.get("image", "specular")),
+                    used_texture_names,
+                )
+                if add_texture(slot, "specular", specular, name, required_by_wzm=True):
+                    material_names.setdefault(slot, {})["specular"] = name
+                    if wzu_path and role_targets["specular"]:
+                        old = role_targets["specular"][min(slot, len(role_targets["specular"]) - 1)]["name"]
+                        wzu_replacements[str(old)] = name
+            elif "specular" in failed_roles:
+                shader_warnings.append("高光图片已连接但提取失败，因此保留原高光引用")
+            else:
+                material_names.setdefault(slot, {})["specular"] = ""
+                if wzu_path and role_targets["specular"]:
+                    old = role_targets["specular"][min(slot, len(role_targets["specular"]) - 1)]["name"]
+                    name = self._game_texture_name(
+                        Path(model_record["path"]).stem, slot, "sp_off", "neutral",
+                        used_texture_names,
+                    )
+                    if add_texture(slot, "specular", neutral_texture("specular"), name, required_by_wzm=True):
+                        wzu_replacements[str(old)] = name
+            normal = roles.get("normal")
+            if normal:
+                if role_targets["normal"]:
+                    normal_target = role_targets["normal"][min(slot, len(role_targets["normal"]) - 1)]
+                    if wzu_path:
+                        name = self._game_texture_name(
+                            Path(model_record["path"]).stem, slot, "no", str(normal.get("image", "normal")),
+                            used_texture_names,
+                        )
+                        if add_texture(slot, "normal", normal, name, required_by_wzm=True):
+                            wzu_replacements[str(normal_target["name"])] = name
+                    else:
+                        add_texture(slot, "normal", normal, str(normal_target["name"]))
+                else:
+                    shader_warnings.append(
+                        f"{binding.get('name', f'槽位 #{slot + 1}')} 含法线图片，但原 WZU 没有法线引用；"
+                        "当前只回流模型与 WZM 材质，因此未写入这张法线图"
+                    )
+            elif "normal" in failed_roles:
+                shader_warnings.append("法线图片已连接但提取失败，因此保留原法线引用")
+            elif wzu_path and role_targets["normal"]:
+                old = role_targets["normal"][min(slot, len(role_targets["normal"]) - 1)]["name"]
+                name = self._game_texture_name(
+                    Path(model_record["path"]).stem, slot, "no_off", "neutral",
+                    used_texture_names,
+                )
+                if add_texture(slot, "normal", neutral_texture("normal"), name, required_by_wzm=True):
+                    wzu_replacements[str(old)] = name
+
+        staged_wzm = gltf_path.with_name("edited.WZM")
+        repack = repack_wzm_from_gltf(
+            model_record["path"], gltf_path, staged_wzm, material_names=material_names,
+        )
+        staged_wzu = None
+        if wzu_path and wzu_path.is_file() and wzu_replacements:
+            staged_wzu = gltf_path.with_name("edited.WZU")
+            replaced_count = rewrite_wzu_texture_names(wzu_path, staged_wzu, wzu_replacements)
+            shader_warnings.append(f"已按 Blender 着色器更新 WZU 中的 {replaced_count} 个贴图引用")
         accessors = edited.get("accessors", [])
         edited_vertices = 0
         edited_indices = 0
+        edited_submeshes = 0
         edited_minimum: list[float] | None = None
         edited_maximum: list[float] | None = None
         has_uv = False
         has_weights = False
         for mesh in edited.get("meshes", []):
             for primitive in mesh.get("primitives", []):
+                edited_submeshes += 1
                 attrs = primitive.get("attributes", {})
                 if "POSITION" in attrs:
                     position_accessor = accessors[attrs["POSITION"]]
@@ -992,51 +1824,38 @@ class ModEditor(tk.Tk):
         triangles_same = original_triangles == edited_indices // 3
         geometry_same = triangles_same and bounds_same
         vertex_status = "相同" if original_vertices == edited_vertices else "Blender 重排" if geometry_same else "变化"
+        material_slot_status = (
+            "相同" if len(original.submeshes) == edited_submeshes
+            else "自动合并" if len(original.submeshes) == 1 and edited_submeshes > 0
+            else "变化"
+        )
 
-        images: dict[str, Path] = {}
-        for image in edited.get("images", []):
-            uri = unquote(image.get("uri", ""))
-            if uri and not uri.startswith("data:"):
-                path = (gltf_path.parent / uri).resolve()
-                if path.is_file():
-                    images[Path(uri).stem.casefold()] = path
-                    if image.get("name"):
-                        images[str(image["name"]).casefold()] = path
-        material_pairs: list[tuple[Path, Path]] = []
-        texture_diffs = []
-        for material in model_record.get("materials", []):
-            if not material.get("path"):
-                continue
-            target = Path(material["path"])
-            source = images.get(Path(material["name"]).stem.casefold())
-            if source is None:
-                texture_diffs.append((material["name"], "存在", "未导出", "未匹配"))
-                continue
-            old_size, old_hash = self._pixel_digest(target)
-            new_size, new_hash = self._pixel_digest(source)
-            changed = old_size != new_size or old_hash != new_hash
-            texture_diffs.append((material["name"], f"{old_size[0]}×{old_size[1]}", f"{new_size[0]}×{new_size[1]}", "已修改" if changed else "相同"))
-            if changed:
-                material_pairs.append((source, target))
         return {
             "summary": [
                 ("顶点", str(original_vertices), str(edited_vertices), vertex_status),
                 ("三角形", str(original_triangles), str(edited_indices // 3), "相同" if triangles_same else "变化"),
                 ("空间边界", " / ".join(f"{v:.3f}" for v in (*original_minimum, *original_maximum)), " / ".join(f"{v:.3f}" for v in (*(edited_minimum or []), *(edited_maximum or []))), "相同" if bounds_same else "变化"),
                 ("骨骼", str(len(original_bones)), str(len(edited_bones)), "相同" if set(original_bones) == set(edited_bones) else "变化"),
+                ("法线", str(original_vertices), str(repack.normal_count), "将写回"),
                 ("UV", "存在", "存在" if has_uv else "缺失", "相同" if has_uv else "变化"),
                 ("权重", "存在", "存在" if has_weights else "缺失", "相同" if has_weights else "变化"),
-                ("材质槽", str(len(original.submeshes)), str(len(edited.get("materials", []))), "变化" if len(original.submeshes) != len(edited.get("materials", [])) else "相同"),
+                ("材质槽", str(len(original.submeshes)), str(edited_submeshes), material_slot_status),
             ],
             "textures": texture_diffs,
-            "material_pairs": material_pairs,
+            "staged_wzm": staged_wzm,
+            "target_wzm": Path(model_record["path"]),
+            "target_wzm_sha256": sha256(Path(model_record["path"])),
+            "staged_wzu": staged_wzu,
+            "target_wzu": wzu_path,
+            "target_wzu_sha256": sha256(wzu_path) if wzu_path and wzu_path.is_file() else None,
+            "repack_warnings": [*repack.warnings, *shader_warnings],
         }
 
     def _show_blend_diff(self, blend: Path, stage: Path, report: dict) -> None:
         self.status_var.set(f"Blender 差异分析完成：{blend.name}")
         window = tk.Toplevel(self)
         window.title(f"Blender 文件差异 · {blend.name}")
-        window.geometry("900x650")
+        window.geometry("980x700")
         frame = ttk.Frame(window, padding=8)
         frame.pack(fill="both", expand=True)
         tree = ttk.Treeview(frame, columns=("original", "edited", "status"), show="tree headings")
@@ -1047,33 +1866,128 @@ class ModEditor(tk.Tk):
         tree.column("#0", width=260)
         tree.column("original", width=170)
         tree.column("edited", width=170)
-        tree.column("status", width=100, anchor="center")
+        tree.column("status", width=140, anchor="center")
         geometry = tree.insert("", "end", text="模型结构", open=True)
         for name, old, new, status in report["summary"]:
             tree.insert(geometry, "end", text=name, values=(old, new, status))
         textures = tree.insert("", "end", text="材质贴图", open=True)
-        for name, old, new, status in report["textures"]:
-            tree.insert(textures, "end", text=name, values=(old, new, status))
+        texture_by_item: dict[str, dict] = {}
+        for row in report["textures"]:
+            item = tree.insert(
+                textures, "end", text=row["name"],
+                values=(row["original"], row["edited"], row["status"]),
+            )
+            texture_by_item[item] = row
+        if report.get("repack_warnings"):
+            warnings = tree.insert("", "end", text="回流提示", open=True)
+            for warning in report["repack_warnings"]:
+                tree.insert(warnings, "end", text=warning, values=("", "", "提示"))
         tree.pack(fill="both", expand=True)
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x", pady=(7, 0))
         ttk.Button(buttons, text="打开临时导出目录", command=lambda: os.startfile(stage)).pack(side="left")
+
+        def choose_texture() -> None:
+            selection = tree.selection()
+            row = texture_by_item.get(selection[0]) if selection else None
+            if row is None:
+                messagebox.showinfo(APP_TITLE, "请先在“材质贴图”下选择一项。", parent=window)
+                return
+            value = filedialog.askopenfilename(
+                parent=window,
+                title=f"为 {row['name']} 选择导入贴图",
+                initialdir=str(stage),
+                filetypes=(("图片", "*.dds *.tga *.png *.bmp *.jpg *.jpeg"), ("所有文件", "*.*")),
+            )
+            if not value:
+                return
+            source = Path(value)
+            try:
+                with Image.open(source) as image:
+                    width, height = image.size
+                    image.verify()
+            except Exception as exc:
+                messagebox.showerror(APP_TITLE, f"无法读取贴图：\n{exc}", parent=window)
+                return
+            row["source"] = source
+            row["edited"] = f"{width}×{height}"
+            row["status"] = "手动选择（将导入）"
+            tree.item(selection[0], values=(row["original"], row["edited"], row["status"]))
+            refresh_apply_button()
+
+        def ignore_texture() -> None:
+            selection = tree.selection()
+            row = texture_by_item.get(selection[0]) if selection else None
+            if row is None:
+                return
+            if row.get("required_by_wzm") and not Path(row["target"]).is_file():
+                messagebox.showinfo(
+                    APP_TITLE,
+                    "这张贴图使用了新的文件名，并已写入待应用的 WZM。\n"
+                    "若不创建对应图片，游戏会找不到材质；可以改选另一张图片，但不能直接跳过。",
+                    parent=window,
+                )
+                return
+            row["source"] = None
+            row["status"] = "不导入"
+            tree.item(selection[0], values=(row["original"], row["edited"], row["status"]))
+            refresh_apply_button()
+
+        ttk.Button(buttons, text="替换自动提取结果", command=choose_texture).pack(side="left", padx=(5, 0))
+        ttk.Button(buttons, text="不导入选中贴图", command=ignore_texture).pack(side="left", padx=(5, 0))
         apply_button = ttk.Button(
-            buttons, text=f"备份并应用 {len(report['material_pairs'])} 个材质差异",
-            command=lambda: self._apply_blend_materials(window, blend, report["material_pairs"]),
+            buttons,
+            command=lambda: self._apply_blend_changes(window, blend, report),
         )
         apply_button.pack(side="right")
-        if not report["material_pairs"]:
-            apply_button.state(["disabled"])
 
-    def _apply_blend_materials(self, window: tk.Toplevel, blend: Path, pairs: list[tuple[Path, Path]]) -> None:
+        def refresh_apply_button() -> None:
+            count = sum(1 for row in report["textures"] if row.get("source"))
+            apply_button.configure(text=f"备份并应用模型/法线/权重 + {count} 张着色器贴图")
+
+        refresh_apply_button()
+
+    def _apply_blend_changes(self, window: tk.Toplevel, blend: Path, report: dict) -> None:
+        target_wzm = Path(report["target_wzm"])
+        if not target_wzm.is_file() or sha256(target_wzm) != report.get("target_wzm_sha256"):
+            messagebox.showerror(
+                APP_TITLE,
+                "原 WZM 在差异分析后已发生变化。为避免覆盖其他修改，请关闭窗口后重新导入 Blender 文件。",
+                parent=window,
+            )
+            return
+        target_wzu = Path(report["target_wzu"]) if report.get("target_wzu") else None
+        if target_wzu and (
+            not target_wzu.is_file() or sha256(target_wzu) != report.get("target_wzu_sha256")
+        ):
+            messagebox.showerror(
+                APP_TITLE,
+                "原 WZU 在差异分析后已发生变化。为避免覆盖其他修改，请关闭窗口后重新导入 Blender 文件。",
+                parent=window,
+            )
+            return
+        material_pairs = [
+            (Path(row["source"]), Path(row["target"]))
+            for row in report["textures"] if row.get("source")
+        ]
         try:
-            backup = self._apply_material_pairs(pairs, f"Blender 回流：{blend.name}")
+            backup = self._apply_blend_resources(
+                Path(report["staged_wzm"]), target_wzm, material_pairs,
+                f"Blender 模型回流：{blend.name}",
+                staged_wzu=Path(report["staged_wzu"]) if report.get("staged_wzu") else None,
+                target_wzu=target_wzu,
+            )
         except Exception as exc:
-            messagebox.showerror(APP_TITLE, f"应用 Blender 材质失败：\n{exc}")
+            messagebox.showerror(APP_TITLE, f"应用 Blender 修改失败：\n{exc}", parent=window)
             return
         window.destroy()
-        self.status_var.set(f"已应用 {len(pairs)} 个 Blender 材质差异；备份位于 {backup}")
+        self.status_var.set(f"已应用 Blender 模型与 {len(material_pairs)} 张贴图；备份位于 {backup}")
+        if self.current_model:
+            self.current_model["bones"] = -1
+            self.current_model["submeshes"] = -1
+            self.current_model["triangles"] = -1
+            self._refresh_current_model_materials()
+            self._load_model_details(self.current_model)
         self._render_preview()
 
     def _refresh_preview_after_edit(self) -> None:

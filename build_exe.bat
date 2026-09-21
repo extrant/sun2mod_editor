@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions
-for %%I in ("%~dp0..") do set "SOURCE_DIR=%%~fI"
-for %%I in ("%~dp0.") do set "TARGET_DIR=%%~fI"
+for %%I in ("%~dp0.") do set "SOURCE_DIR=%%~fI"
+set "TARGET_DIR=%SOURCE_DIR%"
 set "BUILD_DIR=%TEMP%\SUN_MOD_Editor_Build"
 set "ICON_FILE=%~dp0favicon.ico"
 set "BUILD_ICON=%BUILD_DIR%\favicon.ico"
@@ -49,6 +49,7 @@ py -3 -m nuitka ^
     --windows-icon-from-ico="%BUILD_ICON%" ^
     --include-data-files="%BUILD_ICON%=favicon.ico" ^
     --include-module=wzm_viewer ^
+    --include-module=wzm_repack ^
     --include-module=ewz_inspect ^
     --nofollow-import-to=matplotlib ^
     mod_editor.pyw

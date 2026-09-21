@@ -15,7 +15,7 @@ from wzm_unpack import _texture_role, inspect_wzu_materials
 
 TOOL_DIR = Path(__file__).resolve().parent
 CACHE_FILE = TOOL_DIR / "mod_resource_index.json"
-INDEX_VERSION = 5
+INDEX_VERSION = 6
 INDEX_ROOTS = ("Armor", "Weapon", "Weapon1", "PC", "NPC", "Pet", "Riding")
 
 

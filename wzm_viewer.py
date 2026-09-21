@@ -434,7 +434,7 @@ class EffectLayer:
 
 
 class WZMViewer:
-    def __init__(self, model: WZMModel, effect_code: str = "", wzu_path: Path | None = None, attachments: list[str] | None = None, texture_enabled: bool = True, effect_enabled: bool = True, preview_effect: bool = False, screenshot: Path | None = None, close_after_frame: int = 0, visible: bool = True):
+    def __init__(self, model: WZMModel, effect_code: str = "", wzu_path: Path | None = None, attachments: list[str] | None = None, texture_overrides: dict[int, Path] | None = None, texture_enabled: bool = True, effect_enabled: bool = True, preview_effect: bool = False, screenshot: Path | None = None, close_after_frame: int = 0, visible: bool = True):
         self.model = model
         self.effect_codes = [
             code.strip() for code in effect_code.split(",")
@@ -442,6 +442,7 @@ class WZMViewer:
         ]
         self.wzu_path = wzu_path
         self.attachment_args = attachments or []
+        self.texture_overrides = texture_overrides or {}
         self.effect_codes = list(dict.fromkeys(self.effect_codes))
         self.texture_enabled = texture_enabled
         self.preview_effect = preview_effect
@@ -519,7 +520,9 @@ class WZMViewer:
                 if tangent_length:
                     tangent /= tangent_length
                 rows.append((*position, *normal, *vertex.uv, *tangent))
-            texture_path = resolve_texture(self.model.source.parent, submesh.diffuse)
+            texture_path = self.texture_overrides.get(mesh_index)
+            if texture_path is None or not texture_path.is_file():
+                texture_path = resolve_texture(self.model.source.parent, submesh.diffuse)
             render_mesh = RenderMesh(
                 self.ctx,
                 self.program,
@@ -787,6 +790,10 @@ def main() -> int:
     parser.add_argument("--effect-code", default="")
     parser.add_argument("--wzu", type=Path)
     parser.add_argument("--attachment", action="append", default=[])
+    parser.add_argument(
+        "--texture-override", action="append", default=[], metavar="SLOT=PATH",
+        help="手动指定从 0 开始的子网格贴图；可重复使用",
+    )
     parser.add_argument("--no-effect", action="store_true")
     parser.add_argument("--no-texture", action="store_true")
     parser.add_argument("--preview-effect", action="store_true")
@@ -795,12 +802,19 @@ def main() -> int:
     parser.add_argument("--hidden", action="store_true")
     args = parser.parse_args()
     try:
+        texture_overrides: dict[int, Path] = {}
+        for value in args.texture_override:
+            slot_text, separator, path_text = value.partition("=")
+            if not separator or not slot_text.isdigit() or not path_text:
+                parser.error(f"无效的 --texture-override：{value!r}，应为 SLOT=PATH")
+            texture_overrides[int(slot_text)] = Path(path_text)
         model = parse_wzm(args.source)
         viewer = WZMViewer(
             model,
             effect_code=args.effect_code,
             wzu_path=args.wzu,
             attachments=args.attachment,
+            texture_overrides=texture_overrides,
             texture_enabled=not args.no_texture,
             effect_enabled=not args.no_effect,
             preview_effect=args.preview_effect,
