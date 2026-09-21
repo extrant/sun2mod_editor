@@ -70,6 +70,8 @@ class RepackReport:
     submesh_count: int
     weighted_vertex_count: int
     normal_count: int
+    removed_bones: list[str]
+    fallback_weight_vertices: int
     warnings: list[str]
 
 
@@ -264,7 +266,10 @@ def _merge_primitives(rows: list[PrimitiveData], material_name: str) -> Primitiv
     )
 
 
-def _extract_primitives(reader: GltfReader, original: WZMModel) -> tuple[list[PrimitiveData], list[str]]:
+def _extract_primitives(
+    reader: GltfReader,
+    original: WZMModel,
+) -> tuple[list[PrimitiveData], list[str], list[str], int]:
     document = reader.document
     nodes = document.get("nodes", [])
     meshes = document.get("meshes", [])
@@ -274,6 +279,27 @@ def _extract_primitives(reader: GltfReader, original: WZMModel) -> tuple[list[Pr
     original_bones_folded = {name.casefold(): index for name, index in original_bones.items()}
     warnings: list[str] = ["骨架层级和 WZA 动画保持原文件不变；顶点权重按骨骼名称写回"]
     result: list[PrimitiveData] = []
+    removed_bones: set[str] = set()
+    fallback_weight_vertices = 0
+    node_parents: dict[int, int] = {}
+    for parent_index, parent_node in enumerate(nodes):
+        for child_index in parent_node.get("children", []):
+            node_parents[int(child_index)] = parent_index
+
+    def resolve_original_bone(joint_node: int) -> tuple[int | None, str]:
+        current = joint_node
+        first_name = ""
+        visited: set[int] = set()
+        while 0 <= current < len(nodes) and current not in visited:
+            visited.add(current)
+            name = str(nodes[current].get("name", ""))
+            if not first_name:
+                first_name = name
+            bone_index = original_bones.get(name, original_bones_folded.get(name.casefold()))
+            if bone_index is not None:
+                return bone_index, first_name
+            current = node_parents.get(current, -1)
+        return None, first_name
 
     reachable: set[int] = set()
     scenes = document.get("scenes", [])
@@ -364,10 +390,15 @@ def _extract_primitives(reader: GltfReader, original: WZMModel) -> tuple[list[Pr
                         if not 0 <= ordinal < len(joint_nodes):
                             raise WZMError(f"glTF 权重引用了无效关节：{ordinal}")
                         joint_node = joint_nodes[ordinal]
-                        name = str(nodes[joint_node].get("name", "")) if 0 <= joint_node < len(nodes) else ""
-                        bone_index = original_bones.get(name, original_bones_folded.get(name.casefold()))
+                        bone_index, original_name = resolve_original_bone(joint_node)
+                        direct_name = str(nodes[joint_node].get("name", "")) if 0 <= joint_node < len(nodes) else ""
+                        direct_index = original_bones.get(
+                            direct_name, original_bones_folded.get(direct_name.casefold()),
+                        )
+                        if direct_index is None:
+                            removed_bones.add(direct_name or original_name or str(ordinal))
                         if bone_index is None:
-                            raise WZMError(f"Blender 权重引用了原 WZM 中不存在的骨骼：{name or ordinal}")
+                            continue
                         vertex_weights[vertex_index].append((bone_index, float(weight)))
 
             if original.bones and not joint_keys:
@@ -378,7 +409,8 @@ def _extract_primitives(reader: GltfReader, original: WZMModel) -> tuple[list[Pr
                     combined[bone_index] = combined.get(bone_index, 0.0) + weight
                 ordered = sorted(combined.items(), key=lambda pair: pair[1], reverse=True)
                 if original.bones and not ordered:
-                    raise WZMError(f"Blender 顶点 {vertex_index} 没有任何有效权重")
+                    ordered = [(0, 1.0)]
+                    fallback_weight_vertices += 1
                 total = sum(weight for _bone, weight in ordered) or 1.0
                 vertex_weights[vertex_index] = [(bone, weight / total) for bone, weight in ordered]
 
@@ -394,6 +426,8 @@ def _extract_primitives(reader: GltfReader, original: WZMModel) -> tuple[list[Pr
 
     original_names = [_clean_material_name(_original_material_name(mesh, index)) for index, mesh in enumerate(original.submeshes)]
     edited_names = [_clean_material_name(primitive.material_name) for primitive in result]
+    if not result:
+        raise WZMError("Blender 中没有可回流的三角形网格")
     if len(original.submeshes) == 1 and result:
         if len(result) > 1:
             warnings.append(
@@ -408,17 +442,31 @@ def _extract_primitives(reader: GltfReader, original: WZMModel) -> tuple[list[Pr
         if all(grouped.values()):
             result = [_merge_primitives(grouped[name], _original_material_name(original.submeshes[index], index))
                       for index, name in enumerate(original_names)]
+        elif len(result) == len(original.submeshes):
+            warnings.append("Blender 缺少部分原材质槽名称，已按当前材质槽顺序对应")
         else:
-            missing = [name for name, rows in grouped.items() if not rows]
-            raise WZMError(f"Blender 中缺少原材质槽：{', '.join(missing)}")
+            warnings.append(
+                f"Blender 材质组为 {len(result)}、原 WZM 子网格为 {len(original.submeshes)}；"
+                "已自动合并为一个 WZM 子网格"
+            )
+            result = [_merge_primitives(result, result[0].material_name or _original_material_name(original.submeshes[0], 0))]
     elif len(result) != len(original.submeshes):
-        raise WZMError(
-            f"Blender 三角形材质组为 {len(result)}，原 WZM 子网格为 {len(original.submeshes)}；"
-            "请保留原材质槽名称，或将每个原材质合并为一个槽位"
+        warnings.append(
+            f"Blender 材质组为 {len(result)}、原 WZM 子网格为 {len(original.submeshes)}；"
+            "已自动合并为一个 WZM 子网格"
         )
+        result = [_merge_primitives(result, result[0].material_name or _original_material_name(original.submeshes[0], 0))]
     elif original_names != edited_names:
         warnings.append("Blender 材质名称已变化，已按材质槽顺序对应原 WZM 子网格")
-    return result, warnings
+    if removed_bones:
+        preview = "、".join(sorted(removed_bones)[:8])
+        suffix = f" 等 {len(removed_bones)} 个" if len(removed_bones) > 8 else ""
+        warnings.append(f"已从回流数据删除 Blender 异常骨骼：{preview}{suffix}")
+    if fallback_weight_vertices:
+        warnings.append(
+            f"删除异常骨骼后有 {fallback_weight_vertices} 个顶点没有有效权重，已安全绑定到原骨架根骨"
+        )
+    return result, warnings, sorted(removed_bones), fallback_weight_vertices
 
 
 def _mesh_templates(model: WZMModel) -> tuple[bytes, list[dict[str, bytes]]]:
@@ -600,7 +648,7 @@ def repack_wzm_from_gltf(
 ) -> RepackReport:
     original = parse_wzm(original_path)
     reader = GltfReader(gltf_path)
-    primitives, warnings = _extract_primitives(reader, original)
+    primitives, warnings, removed_bones, fallback_weight_vertices = _extract_primitives(reader, original)
     mesh_chunk, weight_chunk, weighted_vertex_count = _build_chunks(
         original, primitives, material_names=material_names,
     )
@@ -611,7 +659,7 @@ def repack_wzm_from_gltf(
     temporary.write_bytes(rebuilt)
     try:
         parsed = parse_wzm(temporary)
-        if len(parsed.submeshes) != len(original.submeshes):
+        if len(parsed.submeshes) != len(primitives):
             raise WZMError("重建后的 WZM 子网格数量校验失败")
         if len(parsed.bones) != len(original.bones):
             raise WZMError("重建后的 WZM 骨骼数量校验失败")
@@ -626,6 +674,8 @@ def repack_wzm_from_gltf(
         submesh_count=len(primitives),
         weighted_vertex_count=weighted_vertex_count,
         normal_count=sum(len(row.normals) for row in primitives),
+        removed_bones=removed_bones,
+        fallback_weight_vertices=fallback_weight_vertices,
         warnings=warnings,
     )
 

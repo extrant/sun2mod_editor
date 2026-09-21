@@ -78,7 +78,11 @@ bpy.ops.wm.open_mainfile(filepath=blend_path)
 def is_exported(obj):
     return not any(collection.name.startswith('glTF_not_exported') for collection in obj.users_collection)
 
-bpy.ops.object.select_all(action='DESELECT')
+if bpy.context.object and bpy.context.object.mode != 'OBJECT':
+    try:
+        bpy.ops.object.mode_set(mode='OBJECT')
+    except Exception:
+        pass
 for obj in bpy.context.scene.objects:
     obj.select_set(is_exported(obj))
 
@@ -1527,13 +1531,19 @@ class ModEditor(tk.Tk):
         self.status_var.set("正在读取 Blender 修改并计算差异")
         def worker():
             try:
-                subprocess.run(
+                completed = subprocess.run(
                     [
                         str(blender), "--background", "--python", str(script), "--",
                         blend, str(gltf), str(shader_manifest), str(extracted),
                     ],
-                    check=True, timeout=180, creationflags=0x08000000,
+                    check=False, timeout=180, creationflags=0x08000000,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, errors="replace",
                 )
+                if completed.returncode != 0 or not gltf.is_file() or not shader_manifest.is_file():
+                    log_lines = [line for line in completed.stdout.splitlines() if line.strip()]
+                    excerpt = "\n".join(log_lines[-12:]) or "Blender 没有返回日志"
+                    raise RuntimeError(f"Blender 未生成导出文件。\n\n最后的 Blender 日志：\n{excerpt}")
                 report = self._compare_blend_export(model_record, gltf, shader_manifest)
                 self.after(0, self._show_blend_diff, Path(blend), stage, report)
             except Exception as exc:
@@ -1777,7 +1787,11 @@ class ModEditor(tk.Tk):
         if wzu_path and wzu_path.is_file() and wzu_replacements:
             staged_wzu = gltf_path.with_name("edited.WZU")
             replaced_count = rewrite_wzu_texture_names(wzu_path, staged_wzu, wzu_replacements)
-            shader_warnings.append(f"已按 Blender 着色器更新 WZU 中的 {replaced_count} 个贴图引用")
+            if replaced_count:
+                shader_warnings.append(f"已按 Blender 着色器更新 WZU 中的 {replaced_count} 个贴图引用")
+            else:
+                staged_wzu.unlink(missing_ok=True)
+                staged_wzu = None
         accessors = edited.get("accessors", [])
         edited_vertices = 0
         edited_indices = 0
@@ -1825,22 +1839,38 @@ class ModEditor(tk.Tk):
         geometry_same = triangles_same and bounds_same
         vertex_status = "相同" if original_vertices == edited_vertices else "Blender 重排" if geometry_same else "变化"
         material_slot_status = (
-            "相同" if len(original.submeshes) == edited_submeshes
-            else "自动合并" if len(original.submeshes) == 1 and edited_submeshes > 0
-            else "变化"
+            "相同" if len(original.submeshes) == edited_submeshes == repack.submesh_count
+            else f"自动适配为 {repack.submesh_count} 槽"
         )
+        bone_status = (
+            "相同" if set(original_bones) == set(edited_bones)
+            else "异常骨骼已删除" if repack.removed_bones
+            else "保留原 WZM 骨架"
+        )
+        summary = [
+            ("顶点", str(original_vertices), str(edited_vertices), vertex_status),
+            ("三角形", str(original_triangles), str(edited_indices // 3), "相同" if triangles_same else "变化"),
+            ("空间边界", " / ".join(f"{v:.3f}" for v in (*original_minimum, *original_maximum)), " / ".join(f"{v:.3f}" for v in (*(edited_minimum or []), *(edited_maximum or []))), "相同" if bounds_same else "变化"),
+            ("骨骼", str(len(original_bones)), str(len(edited_bones)), bone_status),
+        ]
+        if repack.removed_bones:
+            summary.append((
+                "异常骨骼", "0", str(len(repack.removed_bones)),
+                f"已删除：{'、'.join(repack.removed_bones[:4])}" + ("…" if len(repack.removed_bones) > 4 else ""),
+            ))
+        if repack.fallback_weight_vertices:
+            summary.append((
+                "异常权重顶点", "0", str(repack.fallback_weight_vertices), "已绑定原骨架根骨",
+            ))
+        summary.extend([
+            ("法线", str(original_vertices), str(repack.normal_count), "将写回"),
+            ("UV", "存在", "存在" if has_uv else "缺失", "相同" if has_uv else "变化"),
+            ("权重", "存在", "存在" if has_weights else "缺失", "相同" if has_weights else "变化"),
+            ("材质槽", str(len(original.submeshes)), f"{edited_submeshes} → {repack.submesh_count}", material_slot_status),
+        ])
 
         return {
-            "summary": [
-                ("顶点", str(original_vertices), str(edited_vertices), vertex_status),
-                ("三角形", str(original_triangles), str(edited_indices // 3), "相同" if triangles_same else "变化"),
-                ("空间边界", " / ".join(f"{v:.3f}" for v in (*original_minimum, *original_maximum)), " / ".join(f"{v:.3f}" for v in (*(edited_minimum or []), *(edited_maximum or []))), "相同" if bounds_same else "变化"),
-                ("骨骼", str(len(original_bones)), str(len(edited_bones)), "相同" if set(original_bones) == set(edited_bones) else "变化"),
-                ("法线", str(original_vertices), str(repack.normal_count), "将写回"),
-                ("UV", "存在", "存在" if has_uv else "缺失", "相同" if has_uv else "变化"),
-                ("权重", "存在", "存在" if has_weights else "缺失", "相同" if has_weights else "变化"),
-                ("材质槽", str(len(original.submeshes)), str(edited_submeshes), material_slot_status),
-            ],
+            "summary": summary,
             "textures": texture_diffs,
             "staged_wzm": staged_wzm,
             "target_wzm": Path(model_record["path"]),
@@ -1848,6 +1878,8 @@ class ModEditor(tk.Tk):
             "staged_wzu": staged_wzu,
             "target_wzu": wzu_path,
             "target_wzu_sha256": sha256(wzu_path) if wzu_path and wzu_path.is_file() else None,
+            "removed_bones": repack.removed_bones,
+            "fallback_weight_vertices": repack.fallback_weight_vertices,
             "repack_warnings": [*repack.warnings, *shader_warnings],
         }
 
@@ -1948,6 +1980,14 @@ class ModEditor(tk.Tk):
         refresh_apply_button()
 
     def _apply_blend_changes(self, window: tk.Toplevel, blend: Path, report: dict) -> None:
+        fallback_vertices = int(report.get("fallback_weight_vertices", 0))
+        if fallback_vertices and not messagebox.askyesno(
+            APP_TITLE,
+            f"已删除 Blender 异常骨骼，但有 {fallback_vertices} 个顶点只使用了这些异常骨骼的权重。\n"
+            "程序将它们绑定到原 WZM 根骨，以防产生无权重顶点。\n\n确认继续应用吗？",
+            parent=window,
+        ):
+            return
         target_wzm = Path(report["target_wzm"])
         if not target_wzm.is_file() or sha256(target_wzm) != report.get("target_wzm_sha256"):
             messagebox.showerror(
